@@ -1,22 +1,15 @@
-CC = gcc-4.9
-CFLAGS = -O2 -fopenmp
 
-FC = gfortran-4.9
-FFLAGS = -O2 -fopenmp
+CFLAGS = -static -O2 -DNTIMES=1001
 
-all: stream_f.exe stream_c.exe
+all: hypbench nohypbench
+nohypbench: stream.c vmcall.o
+	$(CC) $(CFLAGS) -DBAREMETAL=1 stream.c vmcall.o -o bench-nohyp
 
-stream_f.exe: stream.f mysecond.o
-	$(CC) $(CFLAGS) -c mysecond.c
-	$(FC) $(FFLAGS) -c stream.f
-	$(FC) $(FFLAGS) stream.o mysecond.o -o stream_f.exe
+hypbench: stream.c vmcall.o
+	$(CC) $(CFLAGS) stream.c vmcall.o -o bench-hyp
 
-stream_c.exe: stream.c
-	$(CC) $(CFLAGS) stream.c -o stream_c.exe
+vmcall.o: vmcall.asm
+	nasm -f elf64 -o vmcall.o vmcall.asm
 
 clean:
-	rm -f stream_f.exe stream_c.exe *.o
-
-# an example of a more complex build line for the Intel icc compiler
-stream.icc: stream.c
-	icc -O3 -xCORE-AVX2 -ffreestanding -qopenmp -DSTREAM_ARRAY_SIZE=80000000 -DNTIMES=20 stream.c -o stream.omp.AVX2.80M.20x.icc
+	rm -f *.o *.dat bench*

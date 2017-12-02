@@ -41,11 +41,28 @@
 /*  5. Absolutely no warranty is expressed or implied.                   */
 /*-----------------------------------------------------------------------*/
 # include <stdio.h>
+# include <stdlib.h>
 # include <unistd.h>
 # include <math.h>
 # include <float.h>
 # include <limits.h>
 # include <sys/time.h>
+# include <stdint.h>
+
+# include "../hypervisor/bfsdk/include/bfvmcallinterface.h"
+
+inline uint64_t tsc() {
+
+	uint64_t high = 0, low = 0;
+	asm __volatile__(
+		"rdtscp;"
+		: "=d" (high), "=a" (low)
+		:
+		: "rcx"
+	);
+
+	return ((high << 32) | low);
+}
 
 /*-----------------------------------------------------------------------
  * INSTRUCTIONS:
@@ -62,13 +79,13 @@
  *           Example 1: One Xeon E3 with 8 MB L3 cache
  *               STREAM_ARRAY_SIZE should be >= 4 million, giving
  *               an array size of 30.5 MB and a total memory requirement
- *               of 91.5 MB.  
+ *               of 91.5 MB.
  *           Example 2: Two Xeon E5's with 20 MB L3 cache each (using OpenMP)
  *               STREAM_ARRAY_SIZE should be >= 20 million, giving
  *               an array size of 153 MB and a total memory requirement
- *               of 458 MB.  
+ *               of 458 MB.
  *       (b) The size should be large enough so that the 'timing calibration'
- *           output by the program is at least 20 clock-ticks.  
+ *           output by the program is at least 20 clock-ticks.
  *           Example: most versions of Windows have a 10 millisecond timer
  *               granularity.  20 "ticks" at 10 ms/tic is 200 milliseconds.
  *               If the chip is capable of 10 GB/s, it moves 2 GB in 200 msec.
@@ -77,7 +94,7 @@
  *      Version 5.10 increases the default array size from 2 million
  *          elements to 10 million elements in response to the increasing
  *          size of L3 caches.  The new default size is large enough for caches
- *          up to 20 MB. 
+ *          up to 20 MB.
  *      Version 5.10 changes the loop index variables from "register int"
  *          to "ssize_t", which allows array indices >2^32 (4 billion)
  *          on properly configured 64-bit systems.  Additional compiler options
@@ -113,8 +130,8 @@
 #endif
 
 /*  Users are allowed to modify the "OFFSET" variable, which *may* change the
- *         relative alignment of the arrays (though compilers may change the 
- *         effective offset by making the arrays non-contiguous on some systems). 
+ *         relative alignment of the arrays (though compilers may change the
+ *         effective offset by making the arrays non-contiguous on some systems).
  *      Use of non-zero values for OFFSET can be especially helpful if the
  *         STREAM_ARRAY_SIZE is set to a value close to a large power of 2.
  *      OFFSET can also be set on the compile line without changing the source
@@ -126,7 +143,7 @@
 
 /*
  *	3) Compile the code with optimization.  Many compilers generate
- *       unreasonably bad code before the optimizer tightens things up.  
+ *       unreasonably bad code before the optimizer tightens things up.
  *     If the results are unreasonably good, on the other hand, the
  *       optimizer might be too smart for me!
  *
@@ -137,7 +154,7 @@
  *     To use multiple cores, you need to tell the compiler to obey the OpenMP
  *       directives in the code.  This varies by compiler, but a common example is
  *            gcc -O -fopenmp stream.c -o stream_omp
- *       The environment variable OMP_NUM_THREADS allows runtime control of the 
+ *       The environment variable OMP_NUM_THREADS allows runtime control of the
  *         number of threads/cores used when the resulting "stream_omp" program
  *         is executed.
  *
@@ -146,9 +163,9 @@
  *     to the compile line.
  *     Note that this changes the minimum array sizes required --- see (1) above.
  *
- *     The preprocessor directive "TUNED" does not do much -- it simply causes the 
+ *     The preprocessor directive "TUNED" does not do much -- it simply causes the
  *       code to call separate functions to execute each kernel.  Trivial versions
- *       of these functions are provided, but they are *not* tuned -- they just 
+ *       of these functions are provided, but they are *not* tuned -- they just
  *       provide predefined interfaces to be replaced with tuned code.
  *
  *
@@ -173,24 +190,32 @@
 # endif
 
 #ifndef STREAM_TYPE
-#define STREAM_TYPE double
+#define STREAM_TYPE uint64_t
+#endif
+
+#ifndef PKT_SIZE
+#define PKT_SIZE 2500
 #endif
 
 static STREAM_TYPE	a[STREAM_ARRAY_SIZE+OFFSET],
 			b[STREAM_ARRAY_SIZE+OFFSET],
 			c[STREAM_ARRAY_SIZE+OFFSET];
 
-static double	avgtime[4] = {0}, maxtime[4] = {0},
-		mintime[4] = {FLT_MAX,FLT_MAX,FLT_MAX,FLT_MAX};
+static uint8_t pkt_src[PKT_SIZE];
+static uint8_t pkt_dst[PKT_SIZE];
 
-static char	*label[4] = {"Copy:      ", "Scale:     ",
-    "Add:       ", "Triad:     "};
+static double	avgcycles[5] = {0}, maxcycles[5] = {0},
+		mincycles[5] = {FLT_MAX,FLT_MAX,FLT_MAX,FLT_MAX,FLT_MAX};
 
-static double	bytes[4] = {
+static char	*label[5] = {"Copy:    ", "Scale:   ",
+    "Add:     ", "Triad:   ", "Pkt Copy: "};
+
+static double bytes[5] = {
     2 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE,
     2 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE,
     3 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE,
-    3 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE
+    3 * sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE,
+    PKT_SIZE
     };
 
 extern double mysecond();
@@ -204,15 +229,54 @@ extern void tuned_STREAM_Triad(STREAM_TYPE scalar);
 #ifdef _OPENMP
 extern int omp_get_num_threads();
 #endif
+
+inline void vmcall__start_bench()
+{
+	const unsigned int VMCALL_START_BENCH = 0x6000;
+	struct vmcall_registers_t regs;
+	regs.r00 = VMCALL_EVENT;
+	regs.r01 = VMCALL_MAGIC_NUMBER;
+	regs.r02 = VMCALL_START_BENCH;
+
+	_vmcall_event(&regs);
+}
+
+struct vmbench_data {
+	uint64_t exit_count;
+	uint64_t tsc_freq_hz;
+};
+
+inline void vmcall__stop_bench(struct vmbench_data *data)
+{
+	const unsigned int VMCALL_STOP_BENCH = 0x7000;
+	struct vmcall_registers_t regs;
+	regs.r00 = VMCALL_EVENT;
+	regs.r01 = VMCALL_MAGIC_NUMBER;
+	regs.r02 = VMCALL_STOP_BENCH;
+
+	_vmcall_event(&regs);
+
+	data->exit_count = regs.r01;
+	data->tsc_freq_hz = regs.r02;
+}
+
 int
-main()
+main(int argc, char **argv)
     {
     int			quantum, checktick();
     int			BytesPerWord;
     int			k;
-    ssize_t		j;
+    size_t		j;
     STREAM_TYPE		scalar;
-    double		t, times[4][NTIMES];
+    uint64_t cycles[5][NTIMES];
+
+    if (argc != 3) {
+        fprintf(stderr, "usage: ./<binary> <stream data file> <packet data file>\n");
+        exit(1);
+    }
+
+    char *stream_file = argv[1];
+    char *packet_file = argv[2];
 
     /* --- SETUP --- determine precision and check timing --- */
 
@@ -220,8 +284,7 @@ main()
     printf("STREAM version $Revision: 5.10 $\n");
     printf(HLINE);
     BytesPerWord = sizeof(STREAM_TYPE);
-    printf("This system uses %d bytes per array element.\n",
-	BytesPerWord);
+    printf("This system uses %d bytes per array element.\n", BytesPerWord);
 
     printf(HLINE);
 #ifdef N
@@ -233,19 +296,19 @@ main()
 #endif
 
     printf("Array size = %llu (elements), Offset = %d (elements)\n" , (unsigned long long) STREAM_ARRAY_SIZE, OFFSET);
-    printf("Memory per array = %.1f MiB (= %.1f GiB).\n", 
+    printf("Memory per array = %.1f MiB (= %.1f GiB).\n",
 	BytesPerWord * ( (double) STREAM_ARRAY_SIZE / 1024.0/1024.0),
 	BytesPerWord * ( (double) STREAM_ARRAY_SIZE / 1024.0/1024.0/1024.0));
     printf("Total memory required = %.1f MiB (= %.1f GiB).\n",
 	(3.0 * BytesPerWord) * ( (double) STREAM_ARRAY_SIZE / 1024.0/1024.),
 	(3.0 * BytesPerWord) * ( (double) STREAM_ARRAY_SIZE / 1024.0/1024./1024.));
     printf("Each kernel will be executed %d times.\n", NTIMES);
-    printf(" The *best* time for each kernel (excluding the first iteration)\n"); 
-    printf(" will be used to compute the reported bandwidth.\n");
+    //printf(" The *best* time for each kernel (excluding the first iteration)\n");
+    //printf(" will be used to compute the reported bandwidth.\n");
 
 #ifdef _OPENMP
     printf(HLINE);
-#pragma omp parallel 
+#pragma omp parallel
     {
 #pragma omp master
 	{
@@ -258,124 +321,185 @@ main()
 #ifdef _OPENMP
 	k = 0;
 #pragma omp parallel
-#pragma omp atomic 
+#pragma omp atomic
 		k++;
     printf ("Number of Threads counted = %i\n",k);
 #endif
 
-    /* Get initial value for system clock. */
 #pragma omp parallel for
     for (j=0; j<STREAM_ARRAY_SIZE; j++) {
-	    a[j] = 1.0;
-	    b[j] = 2.0;
-	    c[j] = 0.0;
+	    a[j] = 1 + j;
+	    b[j] = 2 + j;
+	    c[j] = 0 + j;
 	}
 
-    printf(HLINE);
-
-    if  ( (quantum = checktick()) >= 1) 
-	printf("Your clock granularity/precision appears to be "
-	    "%d microseconds.\n", quantum);
-    else {
-	printf("Your clock granularity appears to be "
-	    "less than one microsecond.\n");
-	quantum = 1;
+    for (j = 0; j < PKT_SIZE; j++) {
+	    pkt_src[j] = j;
     }
 
-    t = mysecond();
-#pragma omp parallel for
-    for (j = 0; j < STREAM_ARRAY_SIZE; j++)
-		a[j] = 2.0E0 * a[j];
-    t = 1.0E6 * (mysecond() - t);
-
-    printf("Each test below will take on the order"
-	" of %d microseconds.\n", (int) t  );
-    printf("   (= %d clock ticks)\n", (int) (t/quantum) );
-    printf("Increase the size of the arrays if this shows that\n");
-    printf("you are not getting at least 20 clock ticks per test.\n");
-
     printf(HLINE);
 
-    printf("WARNING -- The above is only a rough guideline.\n");
-    printf("For best results, please be sure you know the\n");
-    printf("precision of your system timer.\n");
-    printf(HLINE);
-    
+    //if  ( (quantum = checktick()) >= 1)
+    //    printf("Your clock granularity/precision appears to be "
+    //        "%d microseconds.\n", quantum);
+    //else {
+    //    printf("Your clock granularity appears to be "
+    //        "less than one microsecond.\n");
+    //    quantum = 1;
+    //}
+
+    //t = mysecond();
+//#pragma omp parallel for
+    //for (j = 0; j < STREAM_ARRAY_SIZE; j++)
+    //    	a[j] = 2.0E0 * a[j];
+    //t = 1.0E6 * (mysecond() - t);
+
+    //printf("Each test below will take on the order"
+    //    " of %d microseconds.\n", (int) t  );
+    //printf("   (= %d clock ticks)\n", (int) (t/quantum) );
+    //printf("Increase the size of the arrays if this shows that\n");
+    //printf("you are not getting at least 20 clock ticks per test.\n");
+
+    //printf(HLINE);
+
+    //printf("WARNING -- The above is only a rough guideline.\n");
+    //printf("For best results, please be sure you know the\n");
+    //printf("precision of your system timer.\n");
+    //printf(HLINE);
+
     /*	--- MAIN LOOP --- repeat test cases NTIMES times --- */
+
+    /* vmcall into bareflank to start counting exits */
+#ifndef BAREMETAL
+    vmcall__start_bench();
+#endif
 
     scalar = 3.0;
     for (k=0; k<NTIMES; k++)
 	{
-	times[0][k] = mysecond();
-#ifdef TUNED
-        tuned_STREAM_Copy();
-#else
-#pragma omp parallel for
+	cycles[0][k] = tsc();
 	for (j=0; j<STREAM_ARRAY_SIZE; j++)
 	    c[j] = a[j];
-#endif
-	times[0][k] = mysecond() - times[0][k];
-	
-	times[1][k] = mysecond();
-#ifdef TUNED
-        tuned_STREAM_Scale(scalar);
-#else
-#pragma omp parallel for
-	for (j=0; j<STREAM_ARRAY_SIZE; j++)
-	    b[j] = scalar*c[j];
-#endif
-	times[1][k] = mysecond() - times[1][k];
-	
-	times[2][k] = mysecond();
-#ifdef TUNED
-        tuned_STREAM_Add();
-#else
-#pragma omp parallel for
-	for (j=0; j<STREAM_ARRAY_SIZE; j++)
-	    c[j] = a[j]+b[j];
-#endif
-	times[2][k] = mysecond() - times[2][k];
-	
-	times[3][k] = mysecond();
-#ifdef TUNED
-        tuned_STREAM_Triad(scalar);
-#else
-#pragma omp parallel for
-	for (j=0; j<STREAM_ARRAY_SIZE; j++)
-	    a[j] = b[j]+scalar*c[j];
-#endif
-	times[3][k] = mysecond() - times[3][k];
+	cycles[0][k] = tsc() - cycles[0][k];
+
+//	cycles[1][k] = tsc();
+//#ifdef TUNED
+//        tuned_STREAM_Scale(scalar);
+//#else
+//#pragma omp parallel for
+//	for (j=0; j<STREAM_ARRAY_SIZE; j++)
+//	    b[j] = scalar*c[j];
+//#endif
+//	cycles[1][k] = tsc() - cycles[1][k];
+//
+//	cycles[2][k] = tsc();
+//#ifdef TUNED
+//        tuned_STREAM_Add();
+//#else
+//#pragma omp parallel for
+//	for (j=0; j<STREAM_ARRAY_SIZE; j++)
+//	    c[j] = a[j]+b[j];
+//#endif
+//	cycles[2][k] = tsc() - cycles[2][k];
+//
+//	cycles[3][k] = tsc();
+//#ifdef TUNED
+//        tuned_STREAM_Triad(scalar);
+//#else
+//#pragma omp parallel for
+//	for (j=0; j<STREAM_ARRAY_SIZE; j++)
+//	    a[j] = b[j]+scalar*c[j];
+//#endif
+//	cycles[3][k] = tsc() - cycles[3][k];
+
+	cycles[4][k] = tsc();
+	for (j = 0; j < PKT_SIZE; j++) {
+	    pkt_dst[j] = pkt_src[j];
+	}
+	cycles[4][k] = tsc() - cycles[4][k];
+
 	}
 
-    /*	--- SUMMARY --- */
+#ifndef BAREMETAL
+    struct vmbench_data data;
+    vmcall__stop_bench(&data);
+    printf("Total exits during bench: %lu\n", data.exit_count);
+#endif
 
-    for (k=1; k<NTIMES; k++) /* note -- skip first iteration */
-	{
-	for (j=0; j<4; j++)
-	    {
-	    avgtime[j] = avgtime[j] + times[j][k];
-	    mintime[j] = MIN(mintime[j], times[j][k]);
-	    maxtime[j] = MAX(maxtime[j], times[j][k]);
-	    }
-	}
-    
-    printf("Function    Best Rate MB/s  Avg time     Min time     Max time\n");
-    for (j=0; j<4; j++) {
-		avgtime[j] = avgtime[j]/(double)(NTIMES-1);
+    FILE *stream_data, *packet_data;
 
-		printf("%s%12.1f  %11.6f  %11.6f  %11.6f\n", label[j],
-	       1.0E-06 * bytes[j]/mintime[j],
-	       avgtime[j],
-	       mintime[j],
-	       maxtime[j]);
+    stream_data = fopen(stream_file, "w");
+    packet_data = fopen(packet_file, "w");
+
+    if (!(stream_data && packet_data)) {
+	    fprintf(stderr, "Failed to open data files\n");
+	    exit(1);
     }
-    printf(HLINE);
 
-    /* --- Check Results --- */
-    checkSTREAMresults();
-    printf(HLINE);
+    uint64_t sample_size = NTIMES - 1;
+    uint64_t bytes = sizeof(STREAM_TYPE) * STREAM_ARRAY_SIZE;
+
+    fprintf(stream_data, "STREAM COPY\n");
+#ifndef BAREMETAL
+    fprintf(stream_data, "TSC frequency: %.2f GHz\n", (double)data.tsc_freq_hz / 1.0e9);
+#endif
+    fprintf(stream_data, "Array size: %.2f MB\n", (double)bytes / 1024.0 / 1024.0);
+    fprintf(stream_data, "Sample size: %lu\n", sample_size);
+    fprintf(stream_data, "Sample data (cycle count):\n");
+    for (k = 1; k < NTIMES; ++k) {
+	    fprintf(stream_data, "stream %lu\n", cycles[0][k]);
+    }
+    fclose(stream_data);
+
+    bytes = PKT_SIZE;
+    fprintf(packet_data, "PACKET COPY\n");
+#ifndef BAREMETAL
+    fprintf(packet_data, "TSC frequency: %.2f GHz\n", (double)data.tsc_freq_hz / 1.0e9);
+#endif
+    fprintf(packet_data, "Array size: %lu bytes\n", bytes);
+    fprintf(packet_data, "Sample size: %lu\n", sample_size);
+    fprintf(packet_data, "Sample data (cycle count):\n");
+    for (k = 1; k < NTIMES; ++k) {
+	    fprintf(packet_data, "packet %lu\n", cycles[4][k]);
+    }
+    fclose(packet_data);
 
     return 0;
+//
+//    /*	--- SUMMARY --- */
+//
+//    for (k=1; k<NTIMES; k++) /* note -- skip first iteration */
+//	{
+//	for (j=0; j<5; j++)
+//	    {
+//	    avgcycles[j] = avgcycles[j] + cycles[j][k];
+//	    mincycles[j] = MIN(mincycles[j], cycles[j][k]);
+//	    maxcycles[j] = MAX(maxcycles[j], cycles[j][k]);
+//	    }
+//	}
+//
+//    for (j=0; j<5; j++) {
+//        avgcycles[j] = avgcycles[j] / (double)(NTIMES - 1);
+//    }
+//
+//    printf("Op  Avg BW (MB/s)   Avg time (us)       Min time (us)      Max time (us)\n");
+//    for (j=0; j<5; j++) {
+//        printf("%s%12.1f  %11.9f  %11.9f  %11.9f\n",
+//		label[j],
+//		(1.0E-06 * bytes[j]) / (avgcycles[j] * cycle_time),
+//		(avgcycles[j] * cycle_time * 1.0E6),
+//		(mincycles[j] * cycle_time * 1.0E6),
+//		(maxcycles[j] * cycle_time * 1.0E6)
+//	);
+//    }
+//
+//    printf(HLINE);
+//
+//    /* --- Check Results --- */
+//    //checkSTREAMresults();
+//    //printf(HLINE);
+//
+//    return 0;
 }
 
 # define	M	20
